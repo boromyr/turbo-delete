@@ -28,31 +28,17 @@ use std::{
 // change a file to be writable
 pub fn set_writable(path: &Path) {
     let mut perms = std::fs::metadata(path).unwrap().permissions();
-
     perms.set_readonly(false);
-
     std::fs::set_permissions(path, perms).unwrap();
 }
 
 pub fn set_folder_writable(path: &Path) {
-    // get complete list of folders
+    // get complete list of folders and files
     let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
         .follow_links(true)
         .skip_hidden(false)
         .into_iter()
-        .filter(|v| {
-            v.as_ref()
-                .unwrap_or_else(|err| {
-                    eprintln!(
-                        "{} {}",
-                        " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                        err
-                    );
-                    std::process::exit(1);
-                })
-                .path()
-                .is_file()
-        })
+        .filter(|v| v.as_ref().map(|e| e.path().exists()).unwrap_or(false))
         .map(|v| {
             v.unwrap_or_else(|err| {
                 eprintln!(
@@ -63,11 +49,19 @@ pub fn set_folder_writable(path: &Path) {
                 std::process::exit(1);
             })
         })
-        .collect::<Vec<DirEntry<((), ())>>>();
+        .collect();
 
     entries.par_iter().for_each(|entry| {
         set_writable(&entry.path());
     });
+}
+
+fn delete_entry(path: &Path) -> std::io::Result<()> {
+    if path.is_dir() {
+        std::fs::remove_dir_all(path)
+    } else {
+        std::fs::remove_file(path)
+    }
 }
 
 fn main() {
@@ -75,40 +69,69 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<String>>();
 
-    let mut file_path: String = args
+    let mut target_path: String = args
         .get(1)
         .unwrap_or_else(|| {
             eprintln!(
-                "{} {}\n\n{}:\n{} {}",
+                "{} {}\n\n{}:\n{} {}\n{} {}",
                 " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                "Please provide a folder path.".bright_yellow(),
+                "Please provide a path.".bright_yellow(),
                 "Examples".underline(),
                 "turbodelete".bright_cyan(),
                 "./node_modules/".bright_black(),
+                "turbodelete".bright_cyan(),
+                "./file.txt".bright_black(),
             );
             std::process::exit(1);
         })
         .to_string();
 
-    // different methods to test out...
-    // 1. only delete all folders using rm_dir_all
-    // 2. delete folders and files using rm_file
-
-    let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
-
-    if file_path.ends_with('"') {
-        file_path.pop();
+    if target_path.ends_with('"') {
+        target_path.pop();
     }
 
-    let path = PathBuf::from(&file_path);
+    let path = PathBuf::from(&target_path);
 
-    // get complete list of folders
+    if !path.exists() {
+        eprintln!(
+            "{} {}",
+            " ERROR ".on_color(AnsiColors::BrightRed).black(),
+            "Path does not exist.".bright_yellow()
+        );
+        std::process::exit(1);
+    }
+
+    if path.is_file() {
+        // Handle single file deletion
+        println!(
+            "Deleting file: {}",
+            path.display().to_string().bright_green()
+        );
+        set_writable(&path);
+        if let Err(err) = delete_entry(&path) {
+            eprintln!(
+                "{} {}",
+                " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                err
+            );
+            std::process::exit(1);
+        }
+        println!(
+            "File deleted successfully in {} seconds",
+            start.elapsed().as_secs_f32().to_string().bright_red()
+        );
+        return;
+    }
+
+    // Handle directory deletion
+    let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+
+    // get complete list of entries (both files and folders)
     let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
         .follow_links(true)
         .skip_hidden(false)
         .into_iter()
         .par_bridge()
-        .filter(|v| v.as_ref().unwrap().path().is_dir())
         .map(|v| v.unwrap())
         .collect();
 
@@ -121,16 +144,16 @@ fn main() {
     }
 
     let pool = ThreadPool::default();
-
     let mut handles = vec![];
 
-    for (_, entries) in tree.into_iter().rev() {
+    // Delete files first, then directories (in reverse depth order)
+    for (_, entries) in tree.iter().rev() {
+        let entries = entries.clone();
         let bar = bar.clone();
 
         handles.push(pool.evaluate(move || {
             entries.par_iter().for_each(|entry| {
-                let _ = std::fs::remove_dir_all(entry);
-
+                let _ = delete_entry(entry);
                 bar.inc(1);
             });
         }));
@@ -141,18 +164,20 @@ fn main() {
     }
 
     if path.exists() {
-        // Try to fix permisssion issues and delete again
+        // Try to fix permission issues and delete again
         set_folder_writable(&path);
-
-        std::fs::remove_dir_all(path).unwrap_or_else(|err| {
+        if let Err(err) = delete_entry(&path) {
             eprintln!(
                 "{} {}",
                 " ERROR ".on_color(AnsiColors::BrightRed).black(),
                 err
             );
             std::process::exit(1);
-        });
+        }
     }
 
-    bar.println(format!("{}", start.elapsed().as_secs_f32()));
+    println!(
+        "Deletion completed in {} seconds",
+        start.elapsed().as_secs_f32().to_string().bright_green()
+    );
 }
