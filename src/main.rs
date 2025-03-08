@@ -69,115 +69,151 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<String>>();
 
-    let mut target_path: String = args
-        .get(1)
-        .unwrap_or_else(|| {
-            eprintln!(
-                "{} {}\n\n{}:\n{} {}\n{} {}",
-                " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                "Please provide a path.".bright_yellow(),
-                "Examples".underline(),
-                "turbodelete".bright_cyan(),
-                "./node_modules/".bright_black(),
-                "turbodelete".bright_cyan(),
-                "./file.txt".bright_black(),
-            );
-            std::process::exit(1);
-        })
-        .to_string();
-
-    if target_path.ends_with('"') {
-        target_path.pop();
-    }
-
-    let path = PathBuf::from(&target_path);
-
-    if !path.exists() {
+    // Verifica se ci sono argomenti
+    if args.len() <= 1 {
         eprintln!(
-            "{} {}",
+            "{} {}\n\n{}:\n{} {}\n{} {}\n{} {}",
             " ERROR ".on_color(AnsiColors::BrightRed).black(),
-            "Path does not exist.".bright_yellow()
+            "Please provide at least one path.".bright_yellow(),
+            "Examples".underline(),
+            "turbodelete".bright_cyan(),
+            "./node_modules/".bright_black(),
+            "turbodelete".bright_cyan(),
+            "./file1.txt ./file2.txt".bright_black(),
+            "turbodelete".bright_cyan(),
+            "\"path with spaces\" another_path".bright_black(),
         );
         std::process::exit(1);
     }
 
-    if path.is_file() {
-        // Handle single file deletion
-        println!(
-            "Deleting file: {}",
-            path.display().to_string().bright_green()
-        );
-        set_writable(&path);
-        if let Err(err) = delete_entry(&path) {
-            eprintln!(
-                "{} {}",
-                " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                err
-            );
-            std::process::exit(1);
+    // Ignora arg[0] (nome del programma) e processa tutti gli altri argomenti
+    let paths = &args[1..];
+    let mut success_count = 0;
+    let mut error_count = 0;
+
+    for target_path in paths {
+        let mut path_str = target_path.to_string();
+
+        // Rimuovi le virgolette se presenti
+        if path_str.starts_with('"') && path_str.ends_with('"') {
+            path_str = path_str[1..path_str.len() - 1].to_string();
         }
-        println!(
-            "File deleted successfully in {} seconds",
-            start.elapsed().as_secs_f32().to_string().bright_red()
-        );
-        return;
-    }
 
-    // Handle directory deletion
-    let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+        let path = PathBuf::from(&path_str);
 
-    // get complete list of entries (both files and folders)
-    let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
-        .follow_links(true)
-        .skip_hidden(false)
-        .into_iter()
-        .par_bridge()
-        .map(|v| v.unwrap())
-        .collect();
-
-    let bar = ProgressBar::new(entries.len() as u64);
-
-    for entry in entries {
-        tree.entry(entry.depth as u64)
-            .or_insert_with(Vec::new)
-            .push(entry.path());
-    }
-
-    let pool = ThreadPool::default();
-    let mut handles = vec![];
-
-    // Delete files first, then directories (in reverse depth order)
-    for (_, entries) in tree.iter().rev() {
-        let entries = entries.clone();
-        let bar = bar.clone();
-
-        handles.push(pool.evaluate(move || {
-            entries.par_iter().for_each(|entry| {
-                let _ = delete_entry(entry);
-                bar.inc(1);
-            });
-        }));
-    }
-
-    for handle in handles {
-        handle.await_complete();
-    }
-
-    if path.exists() {
-        // Try to fix permission issues and delete again
-        set_folder_writable(&path);
-        if let Err(err) = delete_entry(&path) {
+        if !path.exists() {
             eprintln!(
-                "{} {}",
+                "{} {} {}",
                 " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                err
+                "Path does not exist:".bright_yellow(),
+                path_str
             );
-            std::process::exit(1);
+            error_count += 1;
+            continue;
+        }
+
+        println!("Deleting: {}", path.display().to_string().bright_green());
+
+        if path.is_file() {
+            // Gestione cancellazione singolo file
+            set_writable(&path);
+            if let Err(err) = delete_entry(&path) {
+                eprintln!(
+                    "{} {} {}",
+                    " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                    err,
+                    path_str
+                );
+                error_count += 1;
+                continue;
+            }
+            success_count += 1;
+        } else {
+            // Gestione cancellazione directory
+            let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+
+            // Ottieni lista completa di entries (file e cartelle)
+            let entries: Vec<DirEntry<((), ())>> = match jwalk::WalkDir::new(&path)
+                .follow_links(true)
+                .skip_hidden(false)
+                .into_iter()
+                .par_bridge()
+                .map(|v| v.ok())
+                .filter(Option::is_some)
+                .collect::<Option<Vec<_>>>()
+            {
+                Some(entries) => entries,
+                None => {
+                    eprintln!(
+                        "{} {} {}",
+                        " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                        "Failed to read directory:".bright_yellow(),
+                        path_str
+                    );
+                    error_count += 1;
+                    continue;
+                }
+            };
+
+            let bar = ProgressBar::new(entries.len() as u64);
+
+            for entry in entries {
+                tree.entry(entry.depth as u64)
+                    .or_insert_with(Vec::new)
+                    .push(entry.path());
+            }
+
+            let pool = ThreadPool::default();
+            let mut handles = vec![];
+
+            // Cancella prima i file, poi le directory (in ordine inverso di profondità)
+            for (_, entries) in tree.iter().rev() {
+                let entries = entries.clone();
+                let bar = bar.clone();
+
+                handles.push(pool.evaluate(move || {
+                    entries.par_iter().for_each(|entry| {
+                        let _ = delete_entry(entry);
+                        bar.inc(1);
+                    });
+                }));
+            }
+
+            for handle in handles {
+                handle.await_complete();
+            }
+
+            if path.exists() {
+                // Tenta di risolvere problemi di permessi e cancella di nuovo
+                set_folder_writable(&path);
+                if let Err(err) = delete_entry(&path) {
+                    eprintln!(
+                        "{} {} {}",
+                        " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                        err,
+                        path_str
+                    );
+                    error_count += 1;
+                    continue;
+                }
+            }
+            success_count += 1;
         }
     }
 
-    println!(
-        "Deletion completed in {} seconds",
-        start.elapsed().as_secs_f32().to_string().bright_green()
-    );
+    // Riassunto finale
+    if success_count > 0 && error_count == 0 {
+        println!(
+            "Deletion completed successfully for {} items in {} seconds",
+            success_count.to_string().bright_green(),
+            start.elapsed().as_secs_f32().to_string().bright_yellow()
+        );
+    } else {
+        println!(
+            "Deletion completed with {} successes and {} errors in {} seconds",
+            success_count.to_string().bright_green(),
+            error_count.to_string().bright_red(),
+            start.elapsed().as_secs_f32().to_string().bright_yellow()
+        );
+    }
 }
