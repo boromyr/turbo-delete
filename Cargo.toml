@@ -9,7 +9,7 @@ edition = "2021"
 jwalk = "0.8.1"
 futures = "0.3.31"
 indicatif = "0.17.11"
-owo-colors = "4.1.0"
+owo-colors = "4.2.0"
 rayon = "1.10.0"
 rusty_pool = "0.7.0"
 
@@ -18,3 +18,7 @@ inherits = "release"
 opt-level = 3
 lto = "fat"
 codegen-units = 1    # Reduce number of codegen units to increase optimizations.
+
+[[bin]]
+name = "td"
+path = "src/main.rs"
