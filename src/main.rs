@@ -25,6 +25,9 @@ use std::{
 };
 
 // change a file to be writable
+// Su Windows `set_readonly(false)` si limita a rimuovere l'attributo di sola
+// lettura del file, che è esattamente ciò che serve per poterlo cancellare.
+#[allow(clippy::permissions_set_readonly_false)]
 pub fn set_writable(path: &Path) -> std::io::Result<()> {
     let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_readonly(false);
@@ -33,7 +36,7 @@ pub fn set_writable(path: &Path) -> std::io::Result<()> {
 
 pub fn set_folder_writable(path: &Path) {
     let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(path)
-        .follow_links(true)
+        .follow_links(false)
         .skip_hidden(false)
         .into_iter()
         .filter_map(|v| v.ok())
@@ -52,12 +55,28 @@ pub fn set_folder_writable(path: &Path) {
     });
 }
 
-fn delete_entry(path: &Path) -> std::io::Result<()> {
-    if path.is_dir() {
+// Cancella un singolo elemento dato il suo tipo *senza seguire i link*.
+// Per un reparse point (symlink o junction di Windows) rimuove il link stesso,
+// senza mai entrare nel target: questo evita di cancellare dati esterni alla
+// cartella selezionata (es. un junction verso C:\Windows dentro il target).
+fn delete_typed(path: &Path, file_type: &std::fs::FileType) -> std::io::Result<()> {
+    if file_type.is_symlink() {
+        // Un symlink a directory / junction si rimuove con remove_dir,
+        // un symlink a file con remove_file. Proviamo l'uno e poi l'altro.
+        return std::fs::remove_dir(path).or_else(|_| std::fs::remove_file(path));
+    }
+
+    if file_type.is_dir() {
         std::fs::remove_dir_all(path)
     } else {
         std::fs::remove_file(path)
     }
+}
+
+// Variante che ricava il tipo senza seguire i link (per il top-level e i fallback).
+fn delete_entry(path: &Path) -> std::io::Result<()> {
+    let file_type = std::fs::symlink_metadata(path)?.file_type();
+    delete_typed(path, &file_type)
 }
 
 fn main() {
@@ -94,29 +113,40 @@ fn main() {
 
         let path = PathBuf::from(&path_str);
 
-        if !path.exists() {
-            eprintln!(
-                "{} {} {}",
-                " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                "Path does not exist:".bright_yellow(),
-                path_str
-            );
-            error_count += 1;
-            continue;
-        }
-
-        println!("Deleting: {}", path.display().bright_green());
-
-        if path.is_file() {
-            if let Err(err) = set_writable(&path) {
+        // Usiamo symlink_metadata (che NON segue i link) sia per verificare
+        // l'esistenza sia per ricavare il tipo: così gestiamo anche symlink/junction
+        // eventualmente "rotti", che con path.exists() risulterebbero inesistenti.
+        let file_type = match std::fs::symlink_metadata(&path) {
+            Ok(meta) => meta.file_type(),
+            Err(_) => {
                 eprintln!(
                     "{} {} {}",
                     " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                    "Failed to set writable:".bright_yellow(),
-                    err
+                    "Path does not exist:".bright_yellow(),
+                    path_str
                 );
+                error_count += 1;
+                continue;
             }
-            if let Err(err) = delete_entry(&path) {
+        };
+
+        println!("Deleting: {}", path.display().bright_green());
+
+        // File singolo o symlink/junction: nessun albero da percorrere.
+        if file_type.is_file() || file_type.is_symlink() {
+            // Su un file normale togliamo il flag di sola lettura; sui symlink no,
+            // altrimenti seguiremmo il link modificando i permessi del target.
+            if file_type.is_file() {
+                if let Err(err) = set_writable(&path) {
+                    eprintln!(
+                        "{} {} {}",
+                        " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                        "Failed to set writable:".bright_yellow(),
+                        err
+                    );
+                }
+            }
+            if let Err(err) = delete_typed(&path, &file_type) {
                 eprintln!(
                     "{} {} {}",
                     " ERROR ".on_color(AnsiColors::BrightRed).black(),
@@ -128,10 +158,12 @@ fn main() {
             }
             success_count += 1;
         } else {
-            let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
+            // Directory: (path, tipo) raggruppati per profondità. Conserviamo il
+            // tipo fornito da jwalk per evitare una stat aggiuntiva per ogni voce.
+            let mut tree: BTreeMap<u64, Vec<(PathBuf, std::fs::FileType)>> = BTreeMap::new();
 
             let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
-                .follow_links(true)
+                .follow_links(false)
                 .skip_hidden(false)
                 .into_iter()
                 .filter_map(|v| v.ok())
@@ -142,21 +174,23 @@ fn main() {
             for entry in entries {
                 tree.entry(entry.depth as u64)
                     .or_default()
-                    .push(entry.path());
+                    .push((entry.path(), entry.file_type()));
             }
 
             // Cancella per livello in ordine inverso (foglie prima delle radici).
             // Ogni livello viene completato prima di passare al successivo,
             // eliminando la race condition della versione originale.
             for (_, level_entries) in tree.iter().rev() {
-                level_entries.par_iter().for_each(|entry| {
-                    let _ = delete_entry(entry);
+                level_entries.par_iter().for_each(|(entry, ft)| {
+                    let _ = delete_typed(entry, ft);
                     bar.inc(1);
                 });
             }
 
             bar.finish_and_clear();
 
+            // Fallback: se qualcosa è rimasto (tipicamente file in sola lettura),
+            // rendiamo scrivibile l'intero albero e riproviamo.
             if path.exists() {
                 set_folder_writable(&path);
                 if let Err(err) = delete_entry(&path) {
@@ -192,4 +226,10 @@ fn main() {
     println!("\nPress ENTER to exit...");
     let mut _input = String::new();
     std::io::stdin().read_line(&mut _input).ok();
+
+    // Exit code diverso da zero se almeno una cancellazione è fallita,
+    // così l'esito è verificabile da script/CLI.
+    if error_count > 0 {
+        std::process::exit(1);
+    }
 }
