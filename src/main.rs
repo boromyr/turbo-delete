@@ -17,8 +17,7 @@
 use indicatif::ProgressBar;
 use jwalk::DirEntry;
 use owo_colors::{AnsiColors, OwoColorize};
-use rayon::iter::{IntoParallelRefIterator, ParallelBridge, ParallelIterator};
-use rusty_pool::ThreadPool;
+use rayon::iter::{IntoParallelRefIterator, ParallelIterator};
 use std::{
     collections::BTreeMap,
     path::{Path, PathBuf},
@@ -26,33 +25,30 @@ use std::{
 };
 
 // change a file to be writable
-pub fn set_writable(path: &Path) {
-    let mut perms = std::fs::metadata(path).unwrap().permissions();
+pub fn set_writable(path: &Path) -> std::io::Result<()> {
+    let mut perms = std::fs::metadata(path)?.permissions();
     perms.set_readonly(false);
-    std::fs::set_permissions(path, perms).unwrap();
+    std::fs::set_permissions(path, perms)
 }
 
 pub fn set_folder_writable(path: &Path) {
-    // get complete list of folders and files
-    let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
+    let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(path)
         .follow_links(true)
         .skip_hidden(false)
         .into_iter()
-        .filter(|v| v.as_ref().map(|e| e.path().exists()).unwrap_or(false))
-        .map(|v| {
-            v.unwrap_or_else(|err| {
-                eprintln!(
-                    "{} {}",
-                    " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                    err
-                );
-                std::process::exit(1);
-            })
-        })
+        .filter_map(|v| v.ok())
+        .filter(|e| e.path().exists())
         .collect();
 
     entries.par_iter().for_each(|entry| {
-        set_writable(&entry.path());
+        if let Err(err) = set_writable(&entry.path()) {
+            eprintln!(
+                "{} {} {}",
+                " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                "Failed to set writable:".bright_yellow(),
+                err
+            );
+        }
     });
 }
 
@@ -69,7 +65,6 @@ fn main() {
 
     let args = std::env::args().collect::<Vec<String>>();
 
-    // Verifica se ci sono argomenti
     if args.len() <= 1 {
         eprintln!(
             "{} {}\n\n{}:\n{} {}\n{} {}\n{} {}",
@@ -86,7 +81,6 @@ fn main() {
         std::process::exit(1);
     }
 
-    // Ignora arg[0] (nome del programma) e processa tutti gli altri argomenti
     let paths = &args[1..];
     let mut success_count = 0;
     let mut error_count = 0;
@@ -94,7 +88,6 @@ fn main() {
     for target_path in paths {
         let mut path_str = target_path.to_string();
 
-        // Rimuovi le virgolette se presenti
         if path_str.starts_with('"') && path_str.ends_with('"') {
             path_str = path_str[1..path_str.len() - 1].to_string();
         }
@@ -112,11 +105,17 @@ fn main() {
             continue;
         }
 
-        println!("Deleting: {}", path.display().to_string().bright_green());
+        println!("Deleting: {}", path.display().bright_green());
 
         if path.is_file() {
-            // Gestione cancellazione singolo file
-            set_writable(&path);
+            if let Err(err) = set_writable(&path) {
+                eprintln!(
+                    "{} {} {}",
+                    " ERROR ".on_color(AnsiColors::BrightRed).black(),
+                    "Failed to set writable:".bright_yellow(),
+                    err
+                );
+            }
             if let Err(err) = delete_entry(&path) {
                 eprintln!(
                     "{} {} {}",
@@ -129,62 +128,36 @@ fn main() {
             }
             success_count += 1;
         } else {
-            // Gestione cancellazione directory
             let mut tree: BTreeMap<u64, Vec<PathBuf>> = BTreeMap::new();
 
-            // Ottieni lista completa di entries (file e cartelle)
-            let entries: Vec<DirEntry<((), ())>> = match jwalk::WalkDir::new(&path)
+            let entries: Vec<DirEntry<((), ())>> = jwalk::WalkDir::new(&path)
                 .follow_links(true)
                 .skip_hidden(false)
                 .into_iter()
-                .par_bridge()
-                .map(|v| v.ok())
-                .filter(Option::is_some)
-                .collect::<Option<Vec<_>>>()
-            {
-                Some(entries) => entries,
-                None => {
-                    eprintln!(
-                        "{} {} {}",
-                        " ERROR ".on_color(AnsiColors::BrightRed).black(),
-                        "Failed to read directory:".bright_yellow(),
-                        path_str
-                    );
-                    error_count += 1;
-                    continue;
-                }
-            };
+                .filter_map(|v| v.ok())
+                .collect();
 
             let bar = ProgressBar::new(entries.len() as u64);
 
             for entry in entries {
                 tree.entry(entry.depth as u64)
-                    .or_insert_with(Vec::new)
+                    .or_default()
                     .push(entry.path());
             }
 
-            let pool = ThreadPool::default();
-            let mut handles = vec![];
-
-            // Cancella prima i file, poi le directory (in ordine inverso di profondità)
-            for (_, entries) in tree.iter().rev() {
-                let entries = entries.clone();
-                let bar = bar.clone();
-
-                handles.push(pool.evaluate(move || {
-                    entries.par_iter().for_each(|entry| {
-                        let _ = delete_entry(entry);
-                        bar.inc(1);
-                    });
-                }));
+            // Cancella per livello in ordine inverso (foglie prima delle radici).
+            // Ogni livello viene completato prima di passare al successivo,
+            // eliminando la race condition della versione originale.
+            for (_, level_entries) in tree.iter().rev() {
+                level_entries.par_iter().for_each(|entry| {
+                    let _ = delete_entry(entry);
+                    bar.inc(1);
+                });
             }
 
-            for handle in handles {
-                handle.await_complete();
-            }
+            bar.finish_and_clear();
 
             if path.exists() {
-                // Tenta di risolvere problemi di permessi e cancella di nuovo
                 set_folder_writable(&path);
                 if let Err(err) = delete_entry(&path) {
                     eprintln!(
@@ -201,7 +174,6 @@ fn main() {
         }
     }
 
-    // Riassunto finale
     if success_count > 0 && error_count == 0 {
         println!(
             "Deletion completed successfully for {} items in {} seconds",
@@ -216,4 +188,8 @@ fn main() {
             start.elapsed().as_secs_f32().to_string().bright_yellow()
         );
     }
+
+    println!("\nPress ENTER to exit...");
+    let mut _input = String::new();
+    std::io::stdin().read_line(&mut _input).ok();
 }
